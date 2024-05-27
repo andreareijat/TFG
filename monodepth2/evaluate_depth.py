@@ -3,17 +3,18 @@ from __future__ import absolute_import, division, print_function
 import os
 import cv2
 import numpy as np
-
 import torch
 from torch.utils.data import DataLoader
-
 from layers import disp_to_depth
 from utils import readlines
 from options import MonodepthOptions
-import datasets
 import networks
+import matplotlib.pyplot as plt
+from kitti_dataset import RealSenseDataset
 
 cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
+
+#TODO: CORREGIR RUTA A MAPAS DE PROFUNDIDAD VERDADEROS
 
 
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
@@ -23,6 +24,18 @@ splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 # to convert our stereo predictions to real-world scale we multiply our depths by 5.4.
 STEREO_SCALE_FACTOR = 5.4
 
+# Función para visualizar las profundidades
+def visualize_depths(gt_depth, pred_depth, index):
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.title(f'Ground Truth Depth - Index {index}')
+    plt.imshow(gt_depth, cmap='plasma_r')
+    plt.colorbar(label='Depth (m)')
+    plt.subplot(1, 2, 2)
+    plt.title(f'Predicted Depth - Index {index}')
+    plt.imshow(pred_depth, cmap='plasma_r')
+    plt.colorbar(label='Depth (m)')
+    plt.show()
 
 def compute_errors(gt, pred):
     """Computation of error metrics between predicted and ground truth depths
@@ -65,7 +78,7 @@ def evaluate(opt):
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
 
-    if opt.ext_disp_to_eval is None:
+    if opt.ext_disp_to_eval is None: # si no existen predicciones almacenadas con anterioridad, calcularlas de nuevo
 
         opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
 
@@ -74,17 +87,14 @@ def evaluate(opt):
 
         print("-> Loading weights from {}".format(opt.load_weights_folder))
 
-        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
+        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files2.txt"))
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
         encoder_dict = torch.load(encoder_path)
 
-        dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
-                                           encoder_dict['height'], encoder_dict['width'],
-                                           [0], 4, is_train=False)
-        dataloader = DataLoader(dataset, 16, shuffle=False, num_workers=opt.num_workers,
-                                pin_memory=True, drop_last=False)
+        dataset = RealSenseDataset(opt.data_path, filenames, encoder_dict['height'], encoder_dict['width'], [0], 4, is_train=False)
+        dataloader = DataLoader(dataset, 16, shuffle=False, num_workers=opt.num_workers, pin_memory=True, drop_last=False)
 
         encoder = networks.ResnetEncoder(opt.num_layers, False)
         depth_decoder = networks.DepthDecoder(encoder.num_ch_enc)
@@ -112,17 +122,20 @@ def evaluate(opt):
                     input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
 
                 output = depth_decoder(encoder(input_color))
-
+               
                 pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
-
+                
                 if opt.post_process:
                     N = pred_disp.shape[0] // 2
                     pred_disp = batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])
 
+                
                 pred_disps.append(pred_disp)
+    
 
-        pred_disps = np.concatenate(pred_disps)
+        pred_disps = np.concatenate(pred_disps, axis=0)
+        
 
     else:
         # Load predictions from file
@@ -130,16 +143,15 @@ def evaluate(opt):
         pred_disps = np.load(opt.ext_disp_to_eval)
 
         if opt.eval_eigen_to_benchmark:
-            eigen_to_benchmark_ids = np.load(
-                os.path.join(splits_dir, "benchmark", "eigen_to_benchmark_ids.npy"))
-
+            eigen_to_benchmark_ids = np.load(os.path.join(splits_dir, "benchmark", "eigen_to_benchmark_ids.npy"))
             pred_disps = pred_disps[eigen_to_benchmark_ids]
 
+
     if opt.save_pred_disps:
-        output_path = os.path.join(
-            opt.load_weights_folder, "disps_{}_split.npy".format(opt.eval_split))
+        output_path = os.path.join(opt.load_weights_folder, "disps_{}_split.npy".format(opt.eval_split))
         print("-> Saving predicted disparities to ", output_path)
         np.save(output_path, pred_disps)
+
 
     if opt.no_eval:
         print("-> Evaluation disabled. Done.")
@@ -178,6 +190,8 @@ def evaluate(opt):
     errors = []
     ratios = []
 
+    #calculo de errores entre profundidades predichas por el modelo
+    # y ground truth
     for i in range(pred_disps.shape[0]):
 
         gt_depth = gt_depths[i]
@@ -185,26 +199,34 @@ def evaluate(opt):
 
         pred_disp = pred_disps[i]
         pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
-        pred_depth = 1 / pred_disp
+        pred_depth = 1 / pred_disp #profundidad inversamente proporcional a la disparidad 
 
-        if opt.eval_split == "eigen":
-            mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
+        if len(gt_depth.shape) == 3:
+            gt_depth = gt_depth[:, :, 0]
+        if len(pred_depth.shape) == 3:
+            pred_depth = pred_depth[:, :, 0]
 
-            crop = np.array([0.40810811 * gt_height, 0.99189189 * gt_height,
-                             0.03594771 * gt_width,  0.96405229 * gt_width]).astype(np.int32)
-            crop_mask = np.zeros(mask.shape)
-            crop_mask[crop[0]:crop[1], crop[2]:crop[3]] = 1
-            mask = np.logical_and(mask, crop_mask)
-
-        else:
-            mask = gt_depth > 0
-
+        mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
         pred_depth = pred_depth[mask]
         gt_depth = gt_depth[mask]
 
+        # Comprobación de arrays vacíos
+        if pred_depth.size == 0 or gt_depth.size == 0:
+            print(f"Empty depth arrays at index {i}")
+            continue
+
+        print(f"Index {i}:")
+        print(f"  gt_depth.shape: {gt_depth.shape}")
+        print(f"  pred_depth.shape: {pred_depth.shape}")
+        print(f"  gt_depth min: {gt_depth.min()}, max: {gt_depth.max()}")
+        print(f"  pred_depth min: {pred_depth.min()}, max: {pred_depth.max()}")
+
+
         pred_depth *= opt.pred_depth_scale_factor
+
         if not opt.disable_median_scaling:
             ratio = np.median(gt_depth) / np.median(pred_depth)
+            print(f"  Scaling ratio at index {i}: {ratio}")
             ratios.append(ratio)
             pred_depth *= ratio
 
@@ -224,7 +246,36 @@ def evaluate(opt):
     print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
     print("\n-> Done!")
 
+    # Visualizar algunas imágenes
+    for i in range(25):  # Visualizar las primeras 5 imágenes
+        gt_depth = gt_depths[i]
+        pred_disp = pred_disps[i]
+        pred_depth = 1 / pred_disp
+        pred_depth = cv2.resize(pred_depth, (gt_depth.shape[1], gt_depth.shape[0]))
+        visualize_depths(gt_depth, pred_depth, i)
+
+
+#TODO: COMPROBAR QUE SE LE ESTEN PASANDO A LA RED LAS IMAGENES ORDENADAS, NO SE PUEDEN SORTEAR CREO
+#TODO: COMPROBAR LAS ESCALAS, DEBEN COINCIDIR
 
 if __name__ == "__main__":
     options = MonodepthOptions()
-    evaluate(options.parse())
+
+    opts = options.parse()
+
+    opts.eval_mono = True  # o eval_stereo = True, dependiendo de tu caso
+    opts.eval_stereo = False  # Asegúrate de que sólo uno sea True
+    opts.data_path = "/home/andrea/Escritorio/TFG/monodepth2/datasets/"
+    opts.load_weights_folder = "/home/andrea/Escritorio/TFG/monodepth2/models/mono+stereo_640x192" 
+
+    # Verifica que la carpeta de pesos exista
+    assert os.path.isdir(opts.load_weights_folder), "Cannot find folder at {}".format(opts.load_weights_folder)
+
+    evaluate(opts)
+
+    # print(torch.__version__)
+    # print(torch.version.cuda)
+    # print(torch.backends.cudnn.version())
+
+
+
